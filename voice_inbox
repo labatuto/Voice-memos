@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""
+Voice Inbox — turns Voice Memos into sorted tasks, notes, and actions.
+
+Records land in iCloud via Voice Memos → this script transcribes them
+(OpenAI Whisper) → classifies them (Claude) → routes to the right place.
+"""
+
+import os
+import sys
+import json
+import time
+import glob
+import subprocess
+import datetime
+import hashlib
+import logging
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# CONFIG  (loaded from .env file next to this script)
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+
+def load_env():
+    """Read key=value pairs from .env file."""
+    env_path = SCRIPT_DIR / ".env"
+    if not env_path.exists():
+        print(f"\n❌  Missing .env file at {env_path}")
+        print("   Copy .env.example to .env and add your API keys.")
+        sys.exit(1)
+    config = {}
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, val = line.split("=", 1)
+            config[key.strip()] = val.strip().strip('"').strip("'")
+    return config
+
+ENV = load_env()
+
+OPENAI_API_KEY = ENV.get("OPENAI_API_KEY", "")
+ANTHROPIC_API_KEY = ENV.get("ANTHROPIC_API_KEY", "")
+
+if not OPENAI_API_KEY or not ANTHROPIC_API_KEY:
+    print("❌  Both OPENAI_API_KEY and ANTHROPIC_API_KEY must be set in .env")
+    sys.exit(1)
+
+# Where Voice Memos live on Mac (iCloud sync)
+VOICE_MEMOS_DIR = Path.home() / "Library" / "Mobile Documents" / "iCloud~com~apple~Voicememos" / "Documents"
+
+# Where we keep our outputs
+INBOX_DIR = SCRIPT_DIR / "inbox"
+INBOX_DIR.mkdir(exist_ok=True)
+
+# Ledger of already-processed files
+PROCESSED_LEDGER = SCRIPT_DIR / ".processed"
+
+# How often to check for new memos (seconds)
+POLL_INTERVAL = 30
+
+# ---------------------------------------------------------------------------
+# LOGGING
+# ---------------------------------------------------------------------------
+
+LOG_PATH = SCRIPT_DIR / "voice_inbox.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(LOG_PATH),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("voice-inbox")
+
+# ---------------------------------------------------------------------------
+# PROCESSED-FILE TRACKING
+# ---------------------------------------------------------------------------
+
+def load_processed() -> set:
+    if PROCESSED_LEDGER.exists():
+        return set(PROCESSED_LEDGER.read_text().splitlines())
+    return set()
+
+def mark_processed(file_id: str):
+    with open(PROCESSED_LEDGER, "a") as f:
+        f.write(file_id + "\n")
+
+def file_id(path: Path) -> str:
+    """Stable identifier for a file: name + size."""
+    stat = path.stat()
+    return f"{path.name}::{stat.st_size}"
+
+# ---------------------------------------------------------------------------
+# STEP 1 — Find new voice memos
+# ---------------------------------------------------------------------------
+
+def find_new_memos() -> list[Path]:
+    """Return list of .m4a files that haven't been processed yet."""
+    if not VOICE_MEMOS_DIR.exists():
+        log.warning(f"Voice Memos folder not found: {VOICE_MEMOS_DIR}")
+        log.warning("Make sure iCloud Drive is enabled and Voice Memos are syncing.")
+        return []
+
+    processed = load_processed()
+    new_files = []
+
+    for m4a in sorted(VOICE_MEMOS_DIR.rglob("*.m4a")):
+        fid = file_id(m4a)
+        if fid not in processed:
+            # Make sure the file is done syncing (size stable for 5 seconds)
+            size1 = m4a.stat().st_size
+            if size1 == 0:
+                continue
+            time.sleep(3)
+            try:
+                size2 = m4a.stat().st_size
+            except FileNotFoundError:
+                continue
+            if size1 == size2:
+                new_files.append(m4a)
+
+    return new_files
+
+# ---------------------------------------------------------------------------
+# STEP 2 — Transcribe with OpenAI Whisper API
+# ---------------------------------------------------------------------------
+
+def transcribe(audio_path: Path) -> str:
+    """Send audio to OpenAI Whisper API, return transcript text."""
+    import urllib.request
+    import mimetypes
+
+    log.info(f"  Transcribing: {audio_path.name}")
+
+    # Build multipart form data manually (no external deps needed)
+    boundary = "----VoiceInboxBoundary" + hashlib.md5(str(time.time()).encode()).hexdigest()[:12]
+    
+    body = b""
+    
+    # Add the model field
+    body += f"--{boundary}\r\n".encode()
+    body += b'Content-Disposition: form-data; name="model"\r\n\r\n'
+    body += b"whisper-1\r\n"
+    
+    # Add the file
+    mime_type = "audio/m4a"
+    body += f"--{boundary}\r\n".encode()
+    body += f'Content-Disposition: form-data; name="file"; filename="{audio_path.name}"\r\n'.encode()
+    body += f"Content-Type: {mime_type}\r\n\r\n".encode()
+    body += audio_path.read_bytes()
+    body += b"\r\n"
+    
+    body += f"--{boundary}--\r\n".encode()
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/audio/transcriptions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+            return result.get("text", "")
+    except Exception as e:
+        log.error(f"  Transcription failed: {e}")
+        return ""
+
+# ---------------------------------------------------------------------------
+# STEP 3 — Classify with Claude
+# ---------------------------------------------------------------------------
+
+CLASSIFICATION_PROMPT = """You are an assistant that classifies voice memo transcripts. 
+Given a transcript, determine what the speaker intends and return structured JSON.
+
+Categories:
+- "task": Something the speaker wants to do or remember to do later. 
+- "calendar_event": Something with a specific date/time that should go on a calendar.
+- "research_query": A question or request to look something up or investigate.
+- "message_draft": Something the speaker wants to send to a specific person.
+- "note": A thought, idea, or observation to capture — no action needed.
+
+Return ONLY valid JSON with this structure:
+{
+  "category": "task" | "calendar_event" | "research_query" | "message_draft" | "note",
+  "title": "A short (5-10 word) title summarizing this",
+  "summary": "A clean, 1-2 sentence version of what the speaker said, fixing any transcription artifacts",
+  "urgency": "high" | "normal" | "low",
+  "people_mentioned": ["list", "of", "names"],
+  "datetime_mentioned": "any date or time referenced, or null",
+  "raw_transcript": "the original transcript verbatim"
+}
+
+Do not include any text outside the JSON object."""
+
+def classify(transcript: str) -> dict:
+    """Send transcript to Claude API for classification."""
+    import urllib.request
+
+    log.info("  Classifying with Claude...")
+
+    payload = json.dumps({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 1024,
+        "messages": [
+            {"role": "user", "content": f"Classify this voice memo transcript:\n\n{transcript}"}
+        ],
+        "system": CLASSIFICATION_PROMPT,
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload,
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+            text = result["content"][0]["text"]
+            # Parse the JSON from Claude's response
+            # Strip markdown code fences if present
+            text = text.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1]  # remove first line
+                text = text.rsplit("```", 1)[0]  # remove last fence
+            return json.loads(text)
+    except Exception as e:
+        log.error(f"  Classification failed: {e}")
+        return {
+            "category": "note",
+            "title": "Unclassified memo",
+            "summary": transcript[:200],
+            "urgency": "normal",
+            "people_mentioned": [],
+            "datetime_mentioned": None,
+            "raw_transcript": transcript,
+        }
+
+# ---------------------------------------------------------------------------
+# STEP 4 — Route: save to inbox + create Apple Reminders for tasks
+# ---------------------------------------------------------------------------
+
+def create_apple_reminder(title: str, notes: str = ""):
+    """Create a reminder in Apple Reminders app via osascript."""
+    # Escape for AppleScript
+    title_escaped = title.replace('"', '\\"').replace("'", "'\\''")
+    notes_escaped = notes.replace('"', '\\"').replace("'", "'\\''")
+    
+    script = f'''
+    tell application "Reminders"
+        tell list "Voice Inbox"
+            try
+                make new reminder with properties {{name:"{title_escaped}", body:"{notes_escaped}"}}
+            on error
+                -- If "Voice Inbox" list doesn't exist, use default list
+                tell default list
+                    make new reminder with properties {{name:"{title_escaped}", body:"{notes_escaped}"}}
+                end tell
+            end try
+        end tell
+    end tell
+    '''
+    try:
+        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
+        log.info(f"  ✅ Created reminder: {title}")
+    except Exception as e:
+        log.error(f"  Failed to create reminder: {e}")
+
+def save_to_inbox(classification: dict, audio_filename: str):
+    """Append the classified memo to the daily inbox markdown file."""
+    today = datetime.date.today().isoformat()
+    inbox_file = INBOX_DIR / f"{today}.md"
+
+    timestamp = datetime.datetime.now().strftime("%I:%M %p")
+    cat = classification.get("category", "note")
+    cat_emoji = {
+        "task": "☑️",
+        "calendar_event": "📅",
+        "research_query": "🔍",
+        "message_draft": "✉️",
+        "note": "📝",
+    }.get(cat, "📝")
+
+    entry = f"""
+---
+
+### {cat_emoji} {classification.get('title', 'Untitled')}
+
+**Category:** {cat} · **Urgency:** {classification.get('urgency', 'normal')} · **Time:** {timestamp}  
+**Source:** {audio_filename}
+
+{classification.get('summary', '')}
+
+{f"**People:** {', '.join(classification['people_mentioned'])}" if classification.get('people_mentioned') else ""}
+{f"**Date/time referenced:** {classification['datetime_mentioned']}" if classification.get('datetime_mentioned') else ""}
+
+<details><summary>Raw transcript</summary>
+
+{classification.get('raw_transcript', '')}
+
+</details>
+"""
+
+    # If file doesn't exist yet, add a header
+    if not inbox_file.exists():
+        header = f"# Voice Inbox — {today}\n\nProcessed memos from today.\n"
+        inbox_file.write_text(header)
+
+    with open(inbox_file, "a") as f:
+        f.write(entry)
+
+    log.info(f"  📝 Saved to inbox: {inbox_file.name}")
+
+def route(classification: dict, audio_filename: str):
+    """Route the classified memo to the right destination."""
+
+    # Always save to the markdown inbox
+    save_to_inbox(classification, audio_filename)
+
+    cat = classification.get("category")
+
+    if cat == "task":
+        create_apple_reminder(
+            title=classification.get("title", "Voice memo task"),
+            notes=classification.get("summary", ""),
+        )
+
+    elif cat == "calendar_event":
+        # For v1, just log it — Google Calendar integration comes later
+        log.info(f"  📅 Calendar event noted: {classification.get('title')}")
+        log.info(f"     → Date/time: {classification.get('datetime_mentioned', 'not specified')}")
+
+    elif cat == "research_query":
+        log.info(f"  🔍 Research query logged: {classification.get('title')}")
+
+    elif cat == "message_draft":
+        log.info(f"  ✉️  Message draft logged for: {', '.join(classification.get('people_mentioned', ['unknown']))}")
+
+# ---------------------------------------------------------------------------
+# MAIN LOOP
+# ---------------------------------------------------------------------------
+
+def process_memo(memo_path: Path):
+    """Full pipeline for one voice memo."""
+    log.info(f"📎 Processing: {memo_path.name}")
+
+    # Transcribe
+    transcript = transcribe(memo_path)
+    if not transcript:
+        log.warning(f"  Empty transcript, skipping: {memo_path.name}")
+        mark_processed(file_id(memo_path))
+        return
+
+    log.info(f"  Transcript: {transcript[:100]}...")
+
+    # Classify
+    classification = classify(transcript)
+    classification["raw_transcript"] = transcript  # ensure we always have it
+
+    log.info(f"  Category: {classification.get('category')} — {classification.get('title')}")
+
+    # Route
+    route(classification, memo_path.name)
+
+    # Mark as done
+    mark_processed(file_id(memo_path))
+    log.info(f"  ✅ Done: {memo_path.name}")
+
+def run():
+    """Main polling loop."""
+    log.info("=" * 60)
+    log.info("Voice Inbox started")
+    log.info(f"Watching: {VOICE_MEMOS_DIR}")
+    log.info(f"Inbox:    {INBOX_DIR}")
+    log.info(f"Polling every {POLL_INTERVAL}s")
+    log.info("=" * 60)
+
+    # Check the folder exists on first run
+    if not VOICE_MEMOS_DIR.exists():
+        log.error(f"\n❌  Voice Memos folder not found at:\n   {VOICE_MEMOS_DIR}\n")
+        log.error("This usually means either:")
+        log.error("  1. iCloud Drive isn't enabled on this Mac")
+        log.error("  2. Voice Memos hasn't synced yet")
+        log.error("  3. You haven't recorded any Voice Memos on your phone")
+        log.error("\nTo fix: Open System Settings → Apple ID → iCloud → iCloud Drive")
+        log.error("and make sure it's turned on. Then record a test memo on your phone.\n")
+        sys.exit(1)
+
+    while True:
+        try:
+            new_memos = find_new_memos()
+            if new_memos:
+                log.info(f"Found {len(new_memos)} new memo(s)")
+                for memo in new_memos:
+                    process_memo(memo)
+            # Silently poll (no log spam when idle)
+        except KeyboardInterrupt:
+            log.info("\nStopping Voice Inbox.")
+            break
+        except Exception as e:
+            log.error(f"Error in main loop: {e}")
+
+        time.sleep(POLL_INTERVAL)
+
+if __name__ == "__main__":
+    run()
