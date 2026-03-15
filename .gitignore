@@ -1,0 +1,11 @@
+# Secrets
+.env
+
+# Runtime files
+.processed
+inbox/
+voice_inbox.log
+
+# Python
+__pycache__/
+*.pyc

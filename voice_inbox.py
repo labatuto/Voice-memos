@@ -6,11 +6,9 @@ Records land in iCloud via Voice Memos → this script transcribes them
 (OpenAI Whisper) → classifies them (Claude) → routes to the right place.
 """
 
-import os
 import sys
 import json
 import time
-import glob
 import subprocess
 import datetime
 import hashlib
@@ -180,26 +178,41 @@ def transcribe(audio_path: Path) -> str:
 # STEP 3 — Classify with Claude
 # ---------------------------------------------------------------------------
 
-CLASSIFICATION_PROMPT = """You are an assistant that classifies voice memo transcripts. 
+CLASSIFICATION_PROMPT_TEMPLATE = """You are an assistant that classifies voice memo transcripts.
 Given a transcript, determine what the speaker intends and return structured JSON.
 
+Today is {today_full} ({today_weekday}). Use this to resolve relative dates like
+"tomorrow", "next Thursday", "this weekend", etc. into actual calendar dates.
+
 Categories:
-- "task": Something the speaker wants to do or remember to do later. 
+- "task": Something the speaker wants to do or remember to do later.
 - "calendar_event": Something with a specific date/time that should go on a calendar.
 - "research_query": A question or request to look something up or investigate.
 - "message_draft": Something the speaker wants to send to a specific person.
 - "note": A thought, idea, or observation to capture — no action needed.
 
 Return ONLY valid JSON with this structure:
-{
+{{
   "category": "task" | "calendar_event" | "research_query" | "message_draft" | "note",
   "title": "A short (5-10 word) title summarizing this",
   "summary": "A clean, 1-2 sentence version of what the speaker said, fixing any transcription artifacts",
   "urgency": "high" | "normal" | "low",
   "people_mentioned": ["list", "of", "names"],
   "datetime_mentioned": "any date or time referenced, or null",
-  "raw_transcript": "the original transcript verbatim"
-}
+  "raw_transcript": "the original transcript verbatim",
+
+  "event_start": "ISO 8601 datetime (e.g. 2026-03-16T14:00:00) if category is calendar_event, otherwise null",
+  "event_duration_minutes": 60,
+  "event_location": "location if mentioned, otherwise null",
+
+  "research_question": "A clear, well-formed question to research, if category is research_query, otherwise null"
+}}
+
+For calendar_event: resolve relative dates to actual dates. If no time is given, default to
+9:00 AM. If no duration is mentioned, default to 60 minutes.
+
+For research_query: rephrase the speaker's question clearly so it can be sent directly to an
+AI assistant for research.
 
 Do not include any text outside the JSON object."""
 
@@ -209,13 +222,19 @@ def classify(transcript: str) -> dict:
 
     log.info("  Classifying with Claude...")
 
+    now = datetime.datetime.now()
+    system_prompt = CLASSIFICATION_PROMPT_TEMPLATE.format(
+        today_full=now.strftime("%B %d, %Y"),
+        today_weekday=now.strftime("%A"),
+    )
+
     payload = json.dumps({
         "model": "claude-sonnet-4-20250514",
         "max_tokens": 1024,
         "messages": [
             {"role": "user", "content": f"Classify this voice memo transcript:\n\n{transcript}"}
         ],
-        "system": CLASSIFICATION_PROMPT,
+        "system": system_prompt,
     }).encode()
 
     req = urllib.request.Request(
@@ -282,6 +301,109 @@ def create_apple_reminder(title: str, notes: str = ""):
     except Exception as e:
         log.error(f"  Failed to create reminder: {e}")
 
+def create_calendar_event(title: str, start_iso: str, duration_minutes: int = 60,
+                          location: str = "", notes: str = ""):
+    """Create a calendar event in Apple Calendar via osascript."""
+    try:
+        dt = datetime.datetime.fromisoformat(start_iso)
+    except (ValueError, TypeError):
+        log.warning(f"  Could not parse event date '{start_iso}', skipping calendar event")
+        return
+
+    end_dt = dt + datetime.timedelta(minutes=duration_minutes)
+
+    title_escaped = title.replace('"', '\\"')
+    notes_escaped = notes.replace('"', '\\"')
+    location_escaped = location.replace('"', '\\"') if location else ""
+
+    # Build the AppleScript date by setting components individually (reliable)
+    script = f'''
+    tell application "Calendar"
+        set startDate to current date
+        set year of startDate to {dt.year}
+        set month of startDate to {dt.month}
+        set day of startDate to {dt.day}
+        set hours of startDate to {dt.hour}
+        set minutes of startDate to {dt.minute}
+        set seconds of startDate to 0
+
+        set endDate to current date
+        set year of endDate to {end_dt.year}
+        set month of endDate to {end_dt.month}
+        set day of endDate to {end_dt.day}
+        set hours of endDate to {end_dt.hour}
+        set minutes of endDate to {end_dt.minute}
+        set seconds of endDate to 0
+
+        -- Try "Voice Inbox" calendar, fall back to default
+        set targetCal to missing value
+        try
+            set targetCal to calendar "Voice Inbox"
+        end try
+        if targetCal is missing value then
+            set targetCal to first calendar whose name is not ""
+        end if
+
+        tell targetCal
+            set newEvent to make new event with properties {{summary:"{title_escaped}", start date:startDate, end date:endDate, description:"{notes_escaped}"}}
+            {f'set location of newEvent to "{location_escaped}"' if location_escaped else ""}
+        end tell
+    end tell
+    '''
+    try:
+        result = subprocess.run(["osascript", "-e", script], capture_output=True,
+                                text=True, timeout=15)
+        if result.returncode == 0:
+            log.info(f"  📅 Created calendar event: {title} ({dt.strftime('%b %d, %I:%M %p')})")
+        else:
+            log.error(f"  Calendar event failed: {result.stderr.strip()}")
+    except Exception as e:
+        log.error(f"  Failed to create calendar event: {e}")
+
+
+# ---------------------------------------------------------------------------
+# STEP 4b — Research: ask Claude a question and return the answer
+# ---------------------------------------------------------------------------
+
+def research_with_claude(question: str) -> str:
+    """Send a research question to Claude and return the answer."""
+    import urllib.request
+
+    log.info(f"  🔍 Researching: {question[:80]}...")
+
+    payload = json.dumps({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 2048,
+        "messages": [
+            {"role": "user", "content": question}
+        ],
+        "system": (
+            "You are a helpful research assistant. Give a clear, concise, and accurate "
+            "answer to the user's question. If you're uncertain about something, say so. "
+            "Keep your answer to 2-4 paragraphs unless the question requires more detail."
+        ),
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload,
+        headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            result = json.loads(resp.read())
+            return result["content"][0]["text"]
+    except Exception as e:
+        log.error(f"  Research query failed: {e}")
+        return f"(Research failed: {e})"
+
+
 def save_to_inbox(classification: dict, audio_filename: str):
     """Append the classified memo to the daily inbox markdown file."""
     today = datetime.date.today().isoformat()
@@ -309,12 +431,23 @@ def save_to_inbox(classification: dict, audio_filename: str):
 
 {f"**People:** {', '.join(classification['people_mentioned'])}" if classification.get('people_mentioned') else ""}
 {f"**Date/time referenced:** {classification['datetime_mentioned']}" if classification.get('datetime_mentioned') else ""}
+{f"**Event start:** {classification['event_start']}" if classification.get('event_start') else ""}
+{f"**Location:** {classification['event_location']}" if classification.get('event_location') else ""}
 
 <details><summary>Raw transcript</summary>
 
 {classification.get('raw_transcript', '')}
 
 </details>
+"""
+
+    # If there's a research answer, append it
+    if classification.get("_research_answer"):
+        entry += f"""
+> **Research Answer:**
+>
+> {classification['_research_answer'].replace(chr(10), chr(10) + '> ')}
+
 """
 
     # If file doesn't exist yet, add a header
@@ -329,28 +462,44 @@ def save_to_inbox(classification: dict, audio_filename: str):
 
 def route(classification: dict, audio_filename: str):
     """Route the classified memo to the right destination."""
-
-    # Always save to the markdown inbox
-    save_to_inbox(classification, audio_filename)
-
     cat = classification.get("category")
 
-    if cat == "task":
+    # --- Calendar events → Apple Calendar ---
+    if cat == "calendar_event":
+        create_calendar_event(
+            title=classification.get("title", "Voice memo event"),
+            start_iso=classification.get("event_start", ""),
+            duration_minutes=classification.get("event_duration_minutes", 60),
+            location=classification.get("event_location", "") or "",
+            notes=classification.get("summary", ""),
+        )
+
+    # --- Research queries → Ask Claude, then save answer + create reminder ---
+    elif cat == "research_query":
+        question = classification.get("research_question") or classification.get("summary", "")
+        answer = research_with_claude(question)
+        classification["_research_answer"] = answer
+
+        # Truncate answer for reminder notes (Reminders has limits)
+        short_answer = answer[:500] + ("..." if len(answer) > 500 else "")
+        create_apple_reminder(
+            title=f"🔍 {classification.get('title', 'Research result')}",
+            notes=f"Q: {question}\n\nA: {short_answer}",
+        )
+
+    # --- Tasks → Apple Reminders ---
+    elif cat == "task":
         create_apple_reminder(
             title=classification.get("title", "Voice memo task"),
             notes=classification.get("summary", ""),
         )
 
-    elif cat == "calendar_event":
-        # For v1, just log it — Google Calendar integration comes later
-        log.info(f"  📅 Calendar event noted: {classification.get('title')}")
-        log.info(f"     → Date/time: {classification.get('datetime_mentioned', 'not specified')}")
-
-    elif cat == "research_query":
-        log.info(f"  🔍 Research query logged: {classification.get('title')}")
-
+    # --- Message drafts → just log (use Siri for sending) ---
     elif cat == "message_draft":
         log.info(f"  ✉️  Message draft logged for: {', '.join(classification.get('people_mentioned', ['unknown']))}")
+
+    # Always save to the markdown inbox (after research so answer is included)
+    save_to_inbox(classification, audio_filename)
 
 # ---------------------------------------------------------------------------
 # MAIN LOOP
