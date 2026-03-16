@@ -40,24 +40,18 @@ You should see your test memo there as an `.m4a` file. If so, syncing works.
 
 ---
 
-## Step 2: Get your API keys
+## Step 2: Get your API key
 
-You need two keys. Both are free to set up (you pay tiny amounts per use — expect
-well under $1/month for normal use).
-
-### OpenAI key (for transcription)
-
-1. Go to https://platform.openai.com/api-keys
-2. Sign in or create an account
-3. Click **Create new secret key**
-4. Copy it — you'll need it in a moment
+You need one key. It's free to set up (you pay tiny amounts per use — expect
+well under $1/month for normal use). Transcription is handled by Apple on your
+device, for free.
 
 ### Anthropic key (for Claude)
 
 1. Go to https://console.anthropic.com/settings/keys
-2. Sign in
+2. Sign in or create an account
 3. Click **Create Key**
-4. Copy it
+4. Copy it (starts with `sk-ant-`)
 
 ---
 
@@ -83,8 +77,8 @@ cp .env.example .env
 open -e .env
 ```
 
-This opens the `.env` file in TextEdit. Replace the placeholder values with your
-actual API keys from Step 2. Save and close.
+This opens the `.env` file in TextEdit. Replace the placeholder value with your
+actual API key from Step 2. Save and close.
 
 ---
 
@@ -125,7 +119,11 @@ Polling every 30s
 ```
 
 Now record a voice memo on your phone. Within about a minute, you should see it get
-picked up, transcribed, classified, and routed.
+picked up, transcript extracted, classified, and routed.
+
+**Note:** Apple's on-device transcription may take a few seconds after recording.
+If the script says "No transcript yet, will retry" — that's normal. It will pick
+it up on the next poll cycle (30 seconds).
 
 To stop it: press **Ctrl+C** in Terminal.
 
@@ -205,11 +203,11 @@ launchctl unload ~/Library/LaunchAgents/com.voiceinbox.plist
 
 ## Costs
 
-- **Whisper transcription:** ~$0.006 per minute of audio
+- **Transcription:** Free (done by Apple on your device)
 - **Claude classification:** ~$0.003 per memo
 - **Claude research:** ~$0.01 per research query (uses more tokens for the answer)
-- **Total:** roughly 1-2 cents per voice memo. Even heavy use (10 memos/day) is
-  about $3/month
+- **Total:** roughly half a cent per voice memo. Even heavy use (10 memos/day) is
+  about $1-2/month
 
 ---
 
@@ -222,8 +220,11 @@ Settings → Apple ID → iCloud → iCloud Drive and make sure it's on.
 Make sure your Mac is online. Try opening the Voice Memos app on Mac to kick-start
 the sync.
 
-**"Transcription failed"** → Check your OpenAI API key in `.env`. Make sure you
-have billing set up at https://platform.openai.com/account/billing
+**"No transcript yet, will retry"** → Apple's on-device transcription may take a
+few seconds. The script will automatically retry on the next poll cycle. If it
+persists, make sure you're running macOS Sequoia (15+) on an Apple Silicon Mac
+(M1 or later). Open the Voice Memos app on your Mac and check if the transcript
+appears there.
 
 **"Classification failed"** → Check your Anthropic API key in `.env`. Make sure you
 have credits at https://console.anthropic.com

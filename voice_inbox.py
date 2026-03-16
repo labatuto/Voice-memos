@@ -2,16 +2,17 @@
 """
 Voice Inbox — turns Voice Memos into sorted tasks, notes, and actions.
 
-Records land in iCloud via Voice Memos → this script transcribes them
-(OpenAI Whisper) → classifies them (Claude) → routes to the right place.
+Records land in iCloud via Voice Memos → Apple transcribes them on-device →
+this script reads the transcript from the .m4a file → classifies with Claude →
+routes to the right place.
 """
 
 import sys
 import json
+import struct
 import time
 import subprocess
 import datetime
-import hashlib
 import logging
 from pathlib import Path
 
@@ -40,11 +41,11 @@ def load_env():
 
 ENV = load_env()
 
-OPENAI_API_KEY = ENV.get("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY = ENV.get("ANTHROPIC_API_KEY", "")
 
-if not OPENAI_API_KEY or not ANTHROPIC_API_KEY:
-    print("❌  Both OPENAI_API_KEY and ANTHROPIC_API_KEY must be set in .env")
+if not ANTHROPIC_API_KEY:
+    print("❌  ANTHROPIC_API_KEY must be set in .env")
+    print("   Get one at: https://console.anthropic.com/settings/keys")
     sys.exit(1)
 
 # Where Voice Memos live on Mac (iCloud sync)
@@ -126,53 +127,65 @@ def find_new_memos() -> list[Path]:
     return new_files
 
 # ---------------------------------------------------------------------------
-# STEP 2 — Transcribe with OpenAI Whisper API
+# STEP 2 — Read Apple's on-device transcription from the .m4a file
 # ---------------------------------------------------------------------------
 
+def _find_atom(data: bytes, target: bytes) -> bytes | None:
+    """Walk the MP4 atom tree and return the payload of the target atom."""
+    offset = 0
+    while offset < len(data) - 8:
+        size = struct.unpack(">I", data[offset:offset + 4])[0]
+        atom_type = data[offset + 4:offset + 8]
+        if size < 8:
+            break
+        if atom_type == target:
+            # Return everything after the 8-byte header
+            return data[offset + 8:offset + size]
+        # Container atoms we need to descend into
+        if atom_type in (b"moov", b"trak", b"udta"):
+            result = _find_atom(data[offset + 8:offset + size], target)
+            if result is not None:
+                return result
+        offset += size
+    return None
+
+
 def transcribe(audio_path: Path) -> str:
-    """Send audio to OpenAI Whisper API, return transcript text."""
-    import urllib.request
-    import mimetypes
-
-    log.info(f"  Transcribing: {audio_path.name}")
-
-    # Build multipart form data manually (no external deps needed)
-    boundary = "----VoiceInboxBoundary" + hashlib.md5(str(time.time()).encode()).hexdigest()[:12]
-    
-    body = b""
-    
-    # Add the model field
-    body += f"--{boundary}\r\n".encode()
-    body += b'Content-Disposition: form-data; name="model"\r\n\r\n'
-    body += b"whisper-1\r\n"
-    
-    # Add the file
-    mime_type = "audio/m4a"
-    body += f"--{boundary}\r\n".encode()
-    body += f'Content-Disposition: form-data; name="file"; filename="{audio_path.name}"\r\n'.encode()
-    body += f"Content-Type: {mime_type}\r\n\r\n".encode()
-    body += audio_path.read_bytes()
-    body += b"\r\n"
-    
-    body += f"--{boundary}--\r\n".encode()
-
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/audio/transcriptions",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-        },
-        method="POST",
-    )
+    """Extract Apple's on-device transcription from the .m4a file's tsrp atom."""
+    log.info(f"  Reading transcript: {audio_path.name}")
 
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            result = json.loads(resp.read())
-            return result.get("text", "")
+        data = audio_path.read_bytes()
     except Exception as e:
-        log.error(f"  Transcription failed: {e}")
+        log.error(f"  Could not read file: {e}")
         return ""
+
+    payload = _find_atom(data, b"tsrp")
+    if payload is None:
+        log.warning(f"  No transcription found in {audio_path.name}")
+        log.warning("  (Apple may still be processing — will retry next poll)")
+        return ""
+
+    # The payload starts with "tsrp" prefix before the JSON in some cases,
+    # or is raw JSON. Find the first '{' to be safe.
+    try:
+        json_start = payload.index(b"{")
+        tsrp_json = json.loads(payload[json_start:])
+    except (ValueError, json.JSONDecodeError) as e:
+        log.error(f"  Could not parse transcript JSON: {e}")
+        return ""
+
+    # Extract text from attributedString.runs — runs alternate between
+    # string segments and attribute dictionaries
+    runs = tsrp_json.get("attributedString", {}).get("runs", [])
+    text_parts = [r for r in runs if isinstance(r, str)]
+    transcript = "".join(text_parts).strip()
+
+    if not transcript:
+        log.warning(f"  Transcript was empty in {audio_path.name}")
+        return ""
+
+    return transcript
 
 # ---------------------------------------------------------------------------
 # STEP 3 — Classify with Claude
@@ -509,11 +522,12 @@ def process_memo(memo_path: Path):
     """Full pipeline for one voice memo."""
     log.info(f"📎 Processing: {memo_path.name}")
 
-    # Transcribe
+    # Read Apple's on-device transcription
     transcript = transcribe(memo_path)
     if not transcript:
-        log.warning(f"  Empty transcript, skipping: {memo_path.name}")
-        mark_processed(file_id(memo_path))
+        # Don't mark as processed — Apple may still be transcribing.
+        # We'll retry on the next poll cycle.
+        log.warning(f"  No transcript yet, will retry: {memo_path.name}")
         return
 
     log.info(f"  Transcript: {transcript[:100]}...")

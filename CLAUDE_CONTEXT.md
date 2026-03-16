@@ -17,9 +17,10 @@ Mac handles everything else.
 1. User presses iPhone Action Button → records a Voice Memo
 2. Voice Memo syncs to Mac via iCloud (lands in ~/Library/Mobile Documents/iCloud~com~apple~Voicememos/Documents/)
 3. Script polls that folder every 30 seconds for new .m4a files
-4. New memo → sent to OpenAI Whisper API for transcription
-5. Transcript → sent to Claude API for classification into one of 5 categories
-6. Based on category, the memo is routed:
+4. New memo → Apple has already transcribed it on-device; the transcript is embedded in the .m4a file as a `tsrp` atom containing JSON
+5. Script extracts the transcript from the file (no API call needed)
+6. Transcript → sent to Claude API for classification into one of 5 categories
+7. Based on category, the memo is routed:
 
 | Category | What happens |
 |---|---|
@@ -29,7 +30,14 @@ Mac handles everything else.
 | message_draft | Logged only (user handles messages via Siri) |
 | note | Saved in daily markdown log |
 
-7. Everything is also logged in ~/voice-inbox/inbox/YYYY-MM-DD.md
+8. Everything is also logged in ~/voice-inbox/inbox/YYYY-MM-DD.md
+
+## Requirements
+
+- **macOS Sequoia (15+)** — needed for Apple's on-device Voice Memo transcription
+- **Apple Silicon (M1 or later)** — required by the transcription engine
+- **One API key:** Anthropic (for Claude classification + research answers)
+- **No OpenAI key needed** — transcription is done by Apple on-device, for free
 
 ## The code
 
@@ -37,13 +45,35 @@ The entire script is in the GitHub repo: https://github.com/labatuto/Voice-memos
 Branch: claude/voice-memo-transcription-OM20a
 
 Files:
-- voice_inbox.py — the main script (single file, ~570 lines)
-- .env.example — template for API keys
+- voice_inbox.py — the main script (single file)
+- .env.example — template for API key
 - SETUP.md — user-facing setup guide
 - .gitignore — excludes .env, .processed, inbox/, logs
 
-The script uses ONLY Python standard library (no pip install needed). It talks to
-APIs via urllib and creates Reminders/Calendar events via osascript (AppleScript).
+The script uses ONLY Python standard library (no pip install needed). It reads
+transcriptions from .m4a files directly, talks to the Claude API via urllib, and
+creates Reminders/Calendar events via osascript (AppleScript).
+
+## How the transcription extraction works
+
+Apple embeds the transcript inside the .m4a audio file as a custom MP4 atom
+called `tsrp` (located at moov/trak/udta/tsrp in the atom tree). The payload
+is JSON with this structure:
+
+```json
+{
+  "attributedString": {
+    "runs": ["Hello ", {"attr": "..."}, "world", {"attr": "..."}]
+  }
+}
+```
+
+The `runs` array alternates between string segments (the actual text) and
+attribute dictionaries (timing/formatting info). The script extracts only the
+string segments and joins them.
+
+If the tsrp atom is not found (Apple hasn't finished transcribing yet), the
+script skips the file and retries on the next poll cycle.
 
 ## What you need to do
 
@@ -63,19 +93,22 @@ Copy .env.example to .env:
 cp .env.example .env
 ```
 
-Then ask the user for their two API keys and write them into the .env file:
-- OPENAI_API_KEY (from https://platform.openai.com/api-keys)
-- ANTHROPIC_API_KEY (from https://console.anthropic.com/settings/keys)
+Then ask the user for their Anthropic API key and write it into the .env file.
 
 The .env file format is:
 ```
-OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-IMPORTANT: The user said they are NOT technical. Ask them clearly for each key,
-one at a time. If they don't have keys yet, walk them through getting them with
-simple instructions.
+How to get the key:
+1. Go to https://console.anthropic.com/settings/keys
+2. Sign in or create an account
+3. Click "Create Key"
+4. Copy the key (starts with sk-ant-)
+
+IMPORTANT: The user said they are NOT technical. Ask them clearly for the key.
+If they don't have one yet, walk them through getting it with simple
+instructions. This is the ONLY key they need.
 
 ### Step 3: Create "Voice Inbox" list in Apple Reminders
 
@@ -128,8 +161,13 @@ Polling every 30s
 ```
 
 Tell the user to press their Action Button, say something like "remind me to buy
-milk," and wait about a minute. They should see the memo get transcribed,
-classified as a task, and a Reminder should appear on their phone.
+milk," and wait about a minute. They should see the memo get picked up,
+transcript extracted, classified as a task, and a Reminder should appear on
+their phone.
+
+NOTE: Apple's transcription may take a few seconds after recording. If the script
+says "No transcript yet, will retry" — that's normal. It will pick it up on the
+next poll (30 seconds).
 
 ### Step 8 (optional): Auto-start on login
 
@@ -173,11 +211,14 @@ launchctl load ~/Library/LaunchAgents/com.voiceinbox.plist
   unless asked. Just do things and confirm they worked.
 - Don't ask the user to make technical decisions — make them yourself.
 - The script has zero external dependencies. Do NOT run pip install anything.
-- The .env file contains secrets. Never display the API keys back to the user
-  or commit them to git.
+- The .env file contains secrets. Never display the API key back to the user
+  or commit it to git.
 - If something fails, troubleshoot it yourself before asking the user for help.
 - After setup, offer to set up the auto-start LaunchAgent so they don't have to
   manually run the script every time.
+- The transcription requires macOS Sequoia and Apple Silicon. If the user has an
+  Intel Mac, the on-device transcription won't work and they would need an
+  alternative approach.
 
 ## Architecture notes for future iterations
 
