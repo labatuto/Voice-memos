@@ -329,10 +329,13 @@ def create_calendar_event(title: str, start_iso: str, duration_minutes: int = 60
     notes_escaped = notes.replace('"', '\\"')
     location_escaped = location.replace('"', '\\"') if location else ""
 
-    # Build the AppleScript date by setting components individually (reliable)
+    # Build AppleScript dates. Setting day to 1 first avoids month/day rollover
+    # (e.g. if current date is March 31 and target month is Feb, "Feb 31" rolls
+    # to March 3 before the day line ever runs).
     script = f'''
     tell application "Calendar"
         set startDate to current date
+        set day of startDate to 1
         set year of startDate to {dt.year}
         set month of startDate to {dt.month}
         set day of startDate to {dt.day}
@@ -341,6 +344,7 @@ def create_calendar_event(title: str, start_iso: str, duration_minutes: int = 60
         set seconds of startDate to 0
 
         set endDate to current date
+        set day of endDate to 1
         set year of endDate to {end_dt.year}
         set month of endDate to {end_dt.month}
         set day of endDate to {end_dt.day}
@@ -348,13 +352,21 @@ def create_calendar_event(title: str, start_iso: str, duration_minutes: int = 60
         set minutes of endDate to {end_dt.minute}
         set seconds of endDate to 0
 
-        -- Try "Voice Inbox" calendar, fall back to default
+        -- Try "Voice Inbox" calendar, fall back to first writable calendar
         set targetCal to missing value
         try
             set targetCal to calendar "Voice Inbox"
         end try
         if targetCal is missing value then
-            set targetCal to first calendar whose name is not ""
+            repeat with c in calendars
+                if writable of c then
+                    set targetCal to c
+                    exit repeat
+                end if
+            end repeat
+        end if
+        if targetCal is missing value then
+            error "No writable calendar found"
         end if
 
         tell targetCal
