@@ -15,7 +15,7 @@ Mac handles everything else.
 ## The flow
 
 1. User presses iPhone Action Button → records a Voice Memo
-2. Voice Memo syncs to Mac via iCloud (lands in ~/Library/Mobile Documents/iCloud~com~apple~Voicememos/Documents/)
+2. Voice Memo syncs to Mac (lands in ~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings/ on macOS Sequoia+, or ~/Library/Mobile Documents/iCloud~com~apple~Voicememos/Documents/ on older macOS)
 3. Script polls that folder every 30 seconds for new .m4a files
 4. New memo → Apple has already transcribed it on-device; the transcript is embedded in the .m4a file as a `tsrp` atom containing JSON
 5. Script extracts the transcript from the file (no API call needed)
@@ -124,14 +124,18 @@ Run this via osascript:
 osascript -e 'tell application "Calendar" to make new calendar with name "Voice Inbox"'
 ```
 
-### Step 5: Verify iCloud Voice Memos sync
+### Step 5: Verify Voice Memos are syncing to the Mac
 
-Check that this folder exists:
+Check which folder exists (the script auto-detects):
 ```bash
+# macOS Sequoia+ (most likely)
+ls ~/Library/Group\ Containers/group.com.apple.VoiceMemos.shared/Recordings/
+
+# Older macOS (fallback)
 ls ~/Library/Mobile\ Documents/iCloud~com~apple~Voicememos/Documents/
 ```
 
-If it doesn't exist, tell the user to:
+If neither exists, tell the user to:
 1. Open System Settings → [their name] → iCloud → iCloud Drive
 2. Click Options next to iCloud Drive
 3. Make sure Voice Memos is checked
@@ -175,14 +179,14 @@ If the user wants the script to run automatically when they log into their Mac,
 create a LaunchAgent:
 
 ```bash
-cat > ~/Library/LaunchAgents/com.voiceinbox.plist << EOF
+cat > ~/Library/LaunchAgents/com.santi.voice-inbox.plist << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.voiceinbox</string>
+    <string>com.santi.voice-inbox</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
@@ -202,7 +206,7 @@ cat > ~/Library/LaunchAgents/com.voiceinbox.plist << EOF
 </plist>
 EOF
 
-launchctl load ~/Library/LaunchAgents/com.voiceinbox.plist
+launchctl load ~/Library/LaunchAgents/com.santi.voice-inbox.plist
 ```
 
 ## Important notes for Claude in Terminal

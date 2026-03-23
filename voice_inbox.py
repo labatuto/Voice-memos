@@ -2,7 +2,7 @@
 """
 Voice Inbox — turns Voice Memos into sorted tasks, notes, and actions.
 
-Records land in iCloud via Voice Memos → Apple transcribes them on-device →
+Voice Memos recorded on iPhone sync to Mac → Apple transcribes them on-device →
 this script reads the transcript from the .m4a file → classifies with Claude →
 routes to the right place.
 """
@@ -48,8 +48,15 @@ if not ANTHROPIC_API_KEY:
     print("   Get one at: https://console.anthropic.com/settings/keys")
     sys.exit(1)
 
-# Where Voice Memos live on Mac (iCloud sync)
-VOICE_MEMOS_DIR = Path.home() / "Library" / "Mobile Documents" / "iCloud~com~apple~Voicememos" / "Documents"
+# Where Voice Memos live on Mac.
+# macOS Sequoia+ stores recordings in Group Containers; older versions use iCloud sync.
+_VOICE_MEMOS_GROUP = Path.home() / "Library" / "Group Containers" / "group.com.apple.VoiceMemos.shared" / "Recordings"
+_VOICE_MEMOS_ICLOUD = Path.home() / "Library" / "Mobile Documents" / "iCloud~com~apple~Voicememos" / "Documents"
+
+if _VOICE_MEMOS_GROUP.exists():
+    VOICE_MEMOS_DIR = _VOICE_MEMOS_GROUP
+else:
+    VOICE_MEMOS_DIR = _VOICE_MEMOS_ICLOUD
 
 # Where we keep our outputs
 INBOX_DIR = SCRIPT_DIR / "inbox"
@@ -568,8 +575,10 @@ def run():
 
     # Check the folder exists on first run
     if not VOICE_MEMOS_DIR.exists():
-        log.error(f"\n❌  Voice Memos folder not found at:\n   {VOICE_MEMOS_DIR}\n")
-        log.error("This usually means either:")
+        log.error(f"\n❌  Voice Memos folder not found.")
+        log.error(f"   Checked: {_VOICE_MEMOS_GROUP}")
+        log.error(f"   Checked: {_VOICE_MEMOS_ICLOUD}")
+        log.error("\nThis usually means either:")
         log.error("  1. iCloud Drive isn't enabled on this Mac")
         log.error("  2. Voice Memos hasn't synced yet")
         log.error("  3. You haven't recorded any Voice Memos on your phone")

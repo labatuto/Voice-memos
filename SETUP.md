@@ -33,10 +33,14 @@ Now pressing the Action Button starts/stops a voice memo recording.
 5. Wait a minute, then open Finder and press **Cmd+Shift+G**, paste this path:
 
 ```
-~/Library/Mobile Documents/iCloud~com~apple~Voicememos/Documents
+~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings
 ```
 
 You should see your test memo there as an `.m4a` file. If so, syncing works.
+
+> **Note:** On older macOS (pre-Sequoia), memos may be at
+> `~/Library/Mobile Documents/iCloud~com~apple~Voicememos/Documents` instead.
+> The script checks both locations automatically.
 
 ---
 
@@ -113,7 +117,7 @@ You should see:
 
 ```
 Voice Inbox started
-Watching: /Users/yourname/Library/Mobile Documents/iCloud~com~apple~Voicememos/Documents
+Watching: /Users/yourname/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings
 Inbox: /Users/yourname/voice-inbox/inbox
 Polling every 30s
 ```
@@ -134,44 +138,41 @@ To stop it: press **Ctrl+C** in Terminal.
 If you want this to start silently every time you open your Mac:
 
 ```bash
-cat > ~/Library/LaunchAgents/com.voiceinbox.plist << 'EOF'
+cat > ~/Library/LaunchAgents/com.santi.voice-inbox.plist << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.voiceinbox</string>
+    <string>com.santi.voice-inbox</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>voice_inbox.py</string>
+        <string>$HOME/voice-inbox/voice_inbox.py</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>HOMEDIR/voice-inbox</string>
+    <string>$HOME/voice-inbox</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>HOMEDIR/voice-inbox/voice_inbox.log</string>
+    <string>$HOME/voice-inbox/voice_inbox.log</string>
     <key>StandardErrorPath</key>
-    <string>HOMEDIR/voice-inbox/voice_inbox.log</string>
+    <string>$HOME/voice-inbox/voice_inbox.log</string>
 </dict>
 </plist>
 EOF
 
-# Fix the home directory path
-sed -i '' "s|HOMEDIR|$HOME|g" ~/Library/LaunchAgents/com.voiceinbox.plist
-
 # Load it
-launchctl load ~/Library/LaunchAgents/com.voiceinbox.plist
+launchctl load ~/Library/LaunchAgents/com.santi.voice-inbox.plist
 ```
 
 To stop the auto-run later:
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.voiceinbox.plist
+launchctl unload ~/Library/LaunchAgents/com.santi.voice-inbox.plist
 ```
 
 ---
